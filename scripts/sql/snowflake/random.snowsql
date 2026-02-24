@@ -1,0 +1,713 @@
+-- ============================================================
+-- FILE: sales_analytics.snowsql
+-- PURPOSE: Sales analytics and reporting queries
+-- DESCRIPTION: Comprehensive sales data transformations including
+--              customer segmentation, product performance,
+--              regional analysis, and cohort reporting.
+-- ============================================================
+
+
+-- ============================================================
+-- SECTION 1: DATABASE & SCHEMA SETUP
+-- ============================================================
+
+USE DATABASE SALES_DB;
+USE SCHEMA ANALYTICS;
+USE WAREHOUSE ANALYTICS_WH;
+USE ROLE ANALYST_ROLE;
+
+
+-- ============================================================
+-- SECTION 2: CUSTOMER SEGMENTATION
+-- Segment customers based on RFM (Recency, Frequency, Monetary)
+-- ============================================================
+
+CREATE OR REPLACE TABLE ANALYTICS.CUSTOMER_RFM_SEGMENTS AS
+
+WITH ORDER_STATS AS (
+    SELECT
+        o.CUSTOMER_ID,
+        c.CUSTOMER_NAME,
+        c.CUSTOMER_EMAIL,
+        c.REGION,
+        c.SIGNUP_DATE,
+        COUNT(DISTINCT o.ORDER_ID)                                      AS TOTAL_ORDERS,
+        SUM(o.ORDER_AMOUNT)                                             AS TOTAL_SPENT,
+        MAX(o.ORDER_DATE)                                               AS LAST_ORDER_DATE,
+        MIN(o.ORDER_DATE)                                               AS FIRST_ORDER_DATE,
+        DATEDIFF('day', MAX(o.ORDER_DATE), CURRENT_DATE())             AS RECENCY_DAYS,
+        AVG(o.ORDER_AMOUNT)                                             AS AVG_ORDER_VALUE,
+        COUNT(DISTINCT DATE_TRUNC('month', o.ORDER_DATE))              AS ACTIVE_MONTHS
+    FROM
+        RAW.ORDERS o
+        INNER JOIN RAW.CUSTOMERS c
+            ON o.CUSTOMER_ID = c.CUSTOMER_ID
+    WHERE
+        o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+        AND o.ORDER_DATE >= DATEADD('year', -2, CURRENT_DATE())
+    GROUP BY
+        o.CUSTOMER_ID,
+        c.CUSTOMER_NAME,
+        c.CUSTOMER_EMAIL,
+        c.REGION,
+        c.SIGNUP_DATE
+),
+
+RFM_SCORES AS (
+    SELECT
+        CUSTOMER_ID,
+        CUSTOMER_NAME,
+        CUSTOMER_EMAIL,
+        REGION,
+        SIGNUP_DATE,
+        TOTAL_ORDERS,
+        TOTAL_SPENT,
+        LAST_ORDER_DATE,
+        FIRST_ORDER_DATE,
+        RECENCY_DAYS,
+        AVG_ORDER_VALUE,
+        ACTIVE_MONTHS,
+        -- Recency Score: lower days = higher score
+        NTILE(5) OVER (ORDER BY RECENCY_DAYS ASC)                      AS R_SCORE,
+        -- Frequency Score
+        NTILE(5) OVER (ORDER BY TOTAL_ORDERS DESC)                     AS F_SCORE,
+        -- Monetary Score
+        NTILE(5) OVER (ORDER BY TOTAL_SPENT DESC)                      AS M_SCORE,
+        -- Percentile ranks for reporting
+        PERCENT_RANK() OVER (ORDER BY TOTAL_SPENT DESC)                AS SPEND_PERCENTILE,
+        PERCENT_RANK() OVER (ORDER BY TOTAL_ORDERS DESC)               AS ORDER_PERCENTILE,
+        -- Running total of revenue across all customers
+        SUM(TOTAL_SPENT) OVER ()                                       AS GRAND_TOTAL_REVENUE,
+        -- Cumulative revenue ordered by spend
+        SUM(TOTAL_SPENT) OVER (
+            ORDER BY TOTAL_SPENT DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )                                                              AS CUMULATIVE_REVENUE
+    FROM
+        ORDER_STATS
+),
+
+SEGMENTED AS (
+    SELECT
+        *,
+        (R_SCORE + F_SCORE + M_SCORE)                                  AS RFM_TOTAL,
+        CASE
+            WHEN R_SCORE >= 4 AND F_SCORE >= 4 AND M_SCORE >= 4
+                THEN 'Champions'
+            WHEN R_SCORE >= 3 AND F_SCORE >= 3 AND M_SCORE >= 3
+                THEN 'Loyal Customers'
+            WHEN R_SCORE >= 4 AND F_SCORE <= 2
+                THEN 'New Customers'
+            WHEN R_SCORE >= 3 AND F_SCORE >= 2 AND M_SCORE >= 2
+                THEN 'Potential Loyalists'
+            WHEN R_SCORE = 5 AND F_SCORE = 1
+                THEN 'New High-Value'
+            WHEN R_SCORE <= 2 AND F_SCORE >= 4 AND M_SCORE >= 4
+                THEN 'At Risk'
+            WHEN R_SCORE = 1 AND F_SCORE >= 3 AND M_SCORE >= 3
+                THEN 'Cannot Lose Them'
+            WHEN R_SCORE <= 2 AND F_SCORE <= 2
+                THEN 'Hibernating'
+            WHEN R_SCORE <= 2 AND F_SCORE >= 2 AND M_SCORE <= 2
+                THEN 'About to Sleep'
+            ELSE 'Need Attention'
+        END                                                            AS CUSTOMER_SEGMENT,
+        ROUND(CUMULATIVE_REVENUE / GRAND_TOTAL_REVENUE * 100, 2)      AS CUMULATIVE_REVENUE_PCT
+    FROM
+        RFM_SCORES
+)
+
+SELECT
+    *,
+    CASE
+        WHEN CUMULATIVE_REVENUE_PCT <= 80 THEN 'Top 80% Revenue'
+        ELSE 'Remaining 20% Revenue'
+    END AS PARETO_GROUP
+FROM
+    SEGMENTED
+ORDER BY
+    TOTAL_SPENT DESC;
+
+
+-- ============================================================
+-- SECTION 3: PRODUCT PERFORMANCE ANALYSIS
+-- Ranked by revenue within each category with YoY comparison
+-- ============================================================
+
+CREATE OR REPLACE VIEW ANALYTICS.V_PRODUCT_PERFORMANCE AS
+
+WITH CURRENT_YEAR AS (
+    SELECT
+        p.PRODUCT_ID,
+        p.PRODUCT_NAME,
+        p.CATEGORY,
+        p.SUBCATEGORY,
+        p.UNIT_COST,
+        SUM(oi.QUANTITY)                                               AS UNITS_SOLD_CY,
+        SUM(oi.LINE_AMOUNT)                                            AS REVENUE_CY,
+        SUM(oi.LINE_AMOUNT - (p.UNIT_COST * oi.QUANTITY))             AS GROSS_PROFIT_CY,
+        COUNT(DISTINCT oi.ORDER_ID)                                    AS ORDER_COUNT_CY,
+        COUNT(DISTINCT o.CUSTOMER_ID)                                  AS UNIQUE_CUSTOMERS_CY
+    FROM
+        RAW.ORDER_ITEMS oi
+        INNER JOIN RAW.ORDERS o
+            ON oi.ORDER_ID = o.ORDER_ID
+        INNER JOIN RAW.PRODUCTS p
+            ON oi.PRODUCT_ID = p.PRODUCT_ID
+    WHERE
+        YEAR(o.ORDER_DATE) = YEAR(CURRENT_DATE())
+        AND o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+    GROUP BY
+        p.PRODUCT_ID, p.PRODUCT_NAME, p.CATEGORY, p.SUBCATEGORY, p.UNIT_COST
+),
+
+PRIOR_YEAR AS (
+    SELECT
+        p.PRODUCT_ID,
+        SUM(oi.QUANTITY)                                               AS UNITS_SOLD_PY,
+        SUM(oi.LINE_AMOUNT)                                            AS REVENUE_PY,
+        SUM(oi.LINE_AMOUNT - (p.UNIT_COST * oi.QUANTITY))             AS GROSS_PROFIT_PY
+    FROM
+        RAW.ORDER_ITEMS oi
+        INNER JOIN RAW.ORDERS o
+            ON oi.ORDER_ID = o.ORDER_ID
+        INNER JOIN RAW.PRODUCTS p
+            ON oi.PRODUCT_ID = p.PRODUCT_ID
+    WHERE
+        YEAR(o.ORDER_DATE) = YEAR(CURRENT_DATE()) - 1
+        AND o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+    GROUP BY
+        p.PRODUCT_ID
+),
+
+COMBINED AS (
+    SELECT
+        cy.PRODUCT_ID,
+        cy.PRODUCT_NAME,
+        cy.CATEGORY,
+        cy.SUBCATEGORY,
+        cy.UNIT_COST,
+        cy.UNITS_SOLD_CY,
+        cy.REVENUE_CY,
+        cy.GROSS_PROFIT_CY,
+        cy.ORDER_COUNT_CY,
+        cy.UNIQUE_CUSTOMERS_CY,
+        COALESCE(py.UNITS_SOLD_PY, 0)                                  AS UNITS_SOLD_PY,
+        COALESCE(py.REVENUE_PY, 0)                                     AS REVENUE_PY,
+        COALESCE(py.GROSS_PROFIT_PY, 0)                                AS GROSS_PROFIT_PY,
+        -- YoY calculations
+        CASE
+            WHEN COALESCE(py.REVENUE_PY, 0) = 0 THEN NULL
+            ELSE ROUND((cy.REVENUE_CY - py.REVENUE_PY) / py.REVENUE_PY * 100, 2)
+        END                                                            AS REVENUE_YOY_PCT,
+        ROUND(cy.GROSS_PROFIT_CY / NULLIF(cy.REVENUE_CY, 0) * 100, 2) AS GROSS_MARGIN_PCT,
+        -- Rankings within category
+        RANK() OVER (
+            PARTITION BY cy.CATEGORY
+            ORDER BY cy.REVENUE_CY DESC
+        )                                                              AS REVENUE_RANK_IN_CATEGORY,
+        RANK() OVER (
+            PARTITION BY cy.CATEGORY
+            ORDER BY cy.GROSS_PROFIT_CY DESC
+        )                                                              AS PROFIT_RANK_IN_CATEGORY,
+        -- Rankings overall
+        RANK() OVER (ORDER BY cy.REVENUE_CY DESC)                     AS OVERALL_REVENUE_RANK,
+        -- Category revenue share
+        SUM(cy.REVENUE_CY) OVER (
+            PARTITION BY cy.CATEGORY
+        )                                                              AS CATEGORY_TOTAL_REVENUE,
+        SUM(cy.REVENUE_CY) OVER ()                                     AS TOTAL_REVENUE
+    FROM
+        CURRENT_YEAR cy
+        LEFT JOIN PRIOR_YEAR py
+            ON cy.PRODUCT_ID = py.PRODUCT_ID
+)
+
+SELECT
+    PRODUCT_ID,
+    PRODUCT_NAME,
+    CATEGORY,
+    SUBCATEGORY,
+    UNIT_COST,
+    UNITS_SOLD_CY,
+    REVENUE_CY,
+    GROSS_PROFIT_CY,
+    GROSS_MARGIN_PCT,
+    ORDER_COUNT_CY,
+    UNIQUE_CUSTOMERS_CY,
+    UNITS_SOLD_PY,
+    REVENUE_PY,
+    GROSS_PROFIT_PY,
+    REVENUE_YOY_PCT,
+    REVENUE_RANK_IN_CATEGORY,
+    PROFIT_RANK_IN_CATEGORY,
+    OVERALL_REVENUE_RANK,
+    ROUND(REVENUE_CY / NULLIF(CATEGORY_TOTAL_REVENUE, 0) * 100, 2)    AS CATEGORY_REVENUE_SHARE_PCT,
+    ROUND(REVENUE_CY / NULLIF(TOTAL_REVENUE, 0) * 100, 2)             AS OVERALL_REVENUE_SHARE_PCT,
+    CASE
+        WHEN REVENUE_RANK_IN_CATEGORY = 1                  THEN 'Category Leader'
+        WHEN REVENUE_RANK_IN_CATEGORY <= 3                 THEN 'Top 3'
+        WHEN REVENUE_RANK_IN_CATEGORY <= 10                THEN 'Top 10'
+        WHEN REVENUE_YOY_PCT > 20                          THEN 'High Growth'
+        WHEN REVENUE_YOY_PCT < -20                         THEN 'Declining'
+        ELSE 'Stable'
+    END                                                                AS PRODUCT_STATUS
+FROM
+    COMBINED
+-- QUALIFY to keep only top 3 products per category by revenue
+QUALIFY REVENUE_RANK_IN_CATEGORY <= 3;
+
+
+-- ============================================================
+-- SECTION 4: REGIONAL SALES DASHBOARD
+-- Month-over-month trends per region with moving averages
+-- ============================================================
+
+CREATE OR REPLACE TABLE ANALYTICS.REGIONAL_MONTHLY_TRENDS AS
+
+WITH MONTHLY_SALES AS (
+    SELECT
+        c.REGION,
+        c.SUB_REGION,
+        DATE_TRUNC('month', o.ORDER_DATE)                              AS SALES_MONTH,
+        COUNT(DISTINCT o.ORDER_ID)                                     AS ORDER_COUNT,
+        COUNT(DISTINCT o.CUSTOMER_ID)                                  AS UNIQUE_CUSTOMERS,
+        SUM(o.ORDER_AMOUNT)                                            AS TOTAL_REVENUE,
+        AVG(o.ORDER_AMOUNT)                                            AS AVG_ORDER_VALUE,
+        SUM(CASE WHEN o.IS_FIRST_ORDER = TRUE THEN 1 ELSE 0 END)      AS NEW_CUSTOMERS,
+        SUM(CASE WHEN o.IS_FIRST_ORDER = FALSE THEN 1 ELSE 0 END)     AS RETURNING_CUSTOMERS,
+        SUM(CASE WHEN o.CHANNEL = 'ONLINE' THEN o.ORDER_AMOUNT END)   AS ONLINE_REVENUE,
+        SUM(CASE WHEN o.CHANNEL = 'IN_STORE' THEN o.ORDER_AMOUNT END) AS INSTORE_REVENUE,
+        SUM(CASE WHEN o.CHANNEL = 'MOBILE' THEN o.ORDER_AMOUNT END)   AS MOBILE_REVENUE
+    FROM
+        RAW.ORDERS o
+        INNER JOIN RAW.CUSTOMERS c
+            ON o.CUSTOMER_ID = c.CUSTOMER_ID
+    WHERE
+        o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+        AND o.ORDER_DATE >= DATEADD('year', -3, CURRENT_DATE())
+    GROUP BY
+        c.REGION,
+        c.SUB_REGION,
+        DATE_TRUNC('month', o.ORDER_DATE)
+),
+
+WITH_TRENDS AS (
+    SELECT
+        REGION,
+        SUB_REGION,
+        SALES_MONTH,
+        ORDER_COUNT,
+        UNIQUE_CUSTOMERS,
+        TOTAL_REVENUE,
+        AVG_ORDER_VALUE,
+        NEW_CUSTOMERS,
+        RETURNING_CUSTOMERS,
+        ONLINE_REVENUE,
+        INSTORE_REVENUE,
+        MOBILE_REVENUE,
+        -- 3-month moving average
+        AVG(TOTAL_REVENUE) OVER (
+            PARTITION BY REGION, SUB_REGION
+            ORDER BY SALES_MONTH
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        )                                                              AS REVENUE_3M_MA,
+        -- 6-month moving average
+        AVG(TOTAL_REVENUE) OVER (
+            PARTITION BY REGION, SUB_REGION
+            ORDER BY SALES_MONTH
+            ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+        )                                                              AS REVENUE_6M_MA,
+        -- Prior month revenue for MoM comparison
+        LAG(TOTAL_REVENUE, 1) OVER (
+            PARTITION BY REGION, SUB_REGION
+            ORDER BY SALES_MONTH
+        )                                                              AS PREV_MONTH_REVENUE,
+        -- Same month prior year
+        LAG(TOTAL_REVENUE, 12) OVER (
+            PARTITION BY REGION, SUB_REGION
+            ORDER BY SALES_MONTH
+        )                                                              AS SAME_MONTH_LY_REVENUE,
+        -- Cumulative revenue YTD
+        SUM(TOTAL_REVENUE) OVER (
+            PARTITION BY REGION, SUB_REGION, YEAR(SALES_MONTH)
+            ORDER BY SALES_MONTH
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )                                                              AS YTD_REVENUE,
+        -- Region rank by revenue each month
+        RANK() OVER (
+            PARTITION BY SALES_MONTH
+            ORDER BY TOTAL_REVENUE DESC
+        )                                                              AS MONTHLY_REGION_RANK,
+        -- Row number for deduplication safety
+        ROW_NUMBER() OVER (
+            PARTITION BY REGION, SUB_REGION, SALES_MONTH
+            ORDER BY TOTAL_REVENUE DESC
+        )                                                              AS RN
+    FROM
+        MONTHLY_SALES
+)
+
+SELECT
+    REGION,
+    SUB_REGION,
+    SALES_MONTH,
+    ORDER_COUNT,
+    UNIQUE_CUSTOMERS,
+    TOTAL_REVENUE,
+    AVG_ORDER_VALUE,
+    NEW_CUSTOMERS,
+    RETURNING_CUSTOMERS,
+    ONLINE_REVENUE,
+    INSTORE_REVENUE,
+    MOBILE_REVENUE,
+    ROUND(REVENUE_3M_MA, 2)                                            AS REVENUE_3M_MA,
+    ROUND(REVENUE_6M_MA, 2)                                            AS REVENUE_6M_MA,
+    ROUND(
+        CASE
+            WHEN PREV_MONTH_REVENUE IS NULL OR PREV_MONTH_REVENUE = 0 THEN NULL
+            ELSE (TOTAL_REVENUE - PREV_MONTH_REVENUE) / PREV_MONTH_REVENUE * 100
+        END, 2
+    )                                                                  AS MOM_REVENUE_PCT,
+    ROUND(
+        CASE
+            WHEN SAME_MONTH_LY_REVENUE IS NULL OR SAME_MONTH_LY_REVENUE = 0 THEN NULL
+            ELSE (TOTAL_REVENUE - SAME_MONTH_LY_REVENUE) / SAME_MONTH_LY_REVENUE * 100
+        END, 2
+    )                                                                  AS YOY_REVENUE_PCT,
+    YTD_REVENUE,
+    MONTHLY_REGION_RANK,
+    CASE
+        WHEN MONTHLY_REGION_RANK = 1 THEN 'Top Region'
+        WHEN MONTHLY_REGION_RANK <= 3 THEN 'High Performer'
+        WHEN MONTHLY_REGION_RANK <= 5 THEN 'Mid Tier'
+        ELSE 'Needs Attention'
+    END                                                                AS REGION_TIER
+FROM
+    WITH_TRENDS
+WHERE
+    RN = 1   -- safety dedup
+ORDER BY
+    SALES_MONTH DESC,
+    MONTHLY_REGION_RANK ASC;
+
+
+-- ============================================================
+-- SECTION 5: SALES REP PERFORMANCE WITH QUOTA ATTAINMENT
+-- ============================================================
+
+CREATE OR REPLACE VIEW ANALYTICS.V_SALES_REP_PERFORMANCE AS
+
+WITH REP_SALES AS (
+    SELECT
+        sr.REP_ID,
+        sr.REP_NAME,
+        sr.MANAGER_ID,
+        sr.TEAM,
+        sr.REGION,
+        DATE_TRUNC('quarter', o.ORDER_DATE)                            AS SALES_QUARTER,
+        SUM(o.ORDER_AMOUNT)                                            AS ACTUAL_REVENUE,
+        COUNT(DISTINCT o.ORDER_ID)                                     AS DEALS_CLOSED,
+        COUNT(DISTINCT o.CUSTOMER_ID)                                  AS CUSTOMERS_SERVED,
+        AVG(o.ORDER_AMOUNT)                                            AS AVG_DEAL_SIZE,
+        SUM(CASE WHEN o.IS_FIRST_ORDER = TRUE THEN o.ORDER_AMOUNT END) AS NEW_LOGO_REVENUE,
+        SUM(CASE WHEN o.IS_FIRST_ORDER = FALSE THEN o.ORDER_AMOUNT END) AS EXPANSION_REVENUE
+    FROM
+        RAW.ORDERS o
+        INNER JOIN RAW.SALES_REPS sr
+            ON o.REP_ID = sr.REP_ID
+    WHERE
+        o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+    GROUP BY
+        sr.REP_ID, sr.REP_NAME, sr.MANAGER_ID, sr.TEAM, sr.REGION,
+        DATE_TRUNC('quarter', o.ORDER_DATE)
+),
+
+WITH_QUOTA AS (
+    SELECT
+        rs.*,
+        q.QUOTA_AMOUNT,
+        ROUND(rs.ACTUAL_REVENUE / NULLIF(q.QUOTA_AMOUNT, 0) * 100, 2) AS QUOTA_ATTAINMENT_PCT,
+        -- Rank within team per quarter
+        RANK() OVER (
+            PARTITION BY rs.TEAM, rs.SALES_QUARTER
+            ORDER BY rs.ACTUAL_REVENUE DESC
+        )                                                              AS TEAM_RANK,
+        -- Rank within region per quarter
+        RANK() OVER (
+            PARTITION BY rs.REGION, rs.SALES_QUARTER
+            ORDER BY rs.ACTUAL_REVENUE DESC
+        )                                                              AS REGION_RANK,
+        -- Quarter-over-quarter revenue change
+        LAG(rs.ACTUAL_REVENUE, 1) OVER (
+            PARTITION BY rs.REP_ID
+            ORDER BY rs.SALES_QUARTER
+        )                                                              AS PRIOR_QTR_REVENUE,
+        -- Running total for rep across quarters
+        SUM(rs.ACTUAL_REVENUE) OVER (
+            PARTITION BY rs.REP_ID
+            ORDER BY rs.SALES_QUARTER
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )                                                              AS CUMULATIVE_REVENUE,
+        -- Team average for the quarter
+        AVG(rs.ACTUAL_REVENUE) OVER (
+            PARTITION BY rs.TEAM, rs.SALES_QUARTER
+        )                                                              AS TEAM_AVG_REVENUE
+    FROM
+        REP_SALES rs
+        LEFT JOIN RAW.SALES_QUOTAS q
+            ON rs.REP_ID = q.REP_ID
+            AND rs.SALES_QUARTER = q.QUOTA_QUARTER
+)
+
+SELECT
+    REP_ID,
+    REP_NAME,
+    MANAGER_ID,
+    TEAM,
+    REGION,
+    SALES_QUARTER,
+    ACTUAL_REVENUE,
+    QUOTA_AMOUNT,
+    QUOTA_ATTAINMENT_PCT,
+    DEALS_CLOSED,
+    CUSTOMERS_SERVED,
+    ROUND(AVG_DEAL_SIZE, 2)                                            AS AVG_DEAL_SIZE,
+    NEW_LOGO_REVENUE,
+    EXPANSION_REVENUE,
+    TEAM_RANK,
+    REGION_RANK,
+    ROUND(ACTUAL_REVENUE - TEAM_AVG_REVENUE, 2)                       AS VS_TEAM_AVG,
+    ROUND(
+        CASE
+            WHEN PRIOR_QTR_REVENUE IS NULL OR PRIOR_QTR_REVENUE = 0 THEN NULL
+            ELSE (ACTUAL_REVENUE - PRIOR_QTR_REVENUE) / PRIOR_QTR_REVENUE * 100
+        END, 2
+    )                                                                  AS QOQ_GROWTH_PCT,
+    CUMULATIVE_REVENUE,
+    CASE
+        WHEN QUOTA_ATTAINMENT_PCT >= 120  THEN 'Overachiever'
+        WHEN QUOTA_ATTAINMENT_PCT >= 100  THEN 'Quota Met'
+        WHEN QUOTA_ATTAINMENT_PCT >= 80   THEN 'Near Quota'
+        WHEN QUOTA_ATTAINMENT_PCT >= 60   THEN 'Below Quota'
+        ELSE 'Significantly Below'
+    END                                                                AS PERFORMANCE_BAND
+FROM
+    WITH_QUOTA
+-- Only show top performer per team per quarter
+QUALIFY TEAM_RANK = 1;
+
+
+-- ============================================================
+-- SECTION 6: CUSTOMER COHORT RETENTION ANALYSIS
+-- ============================================================
+
+CREATE OR REPLACE TABLE ANALYTICS.COHORT_RETENTION AS
+
+WITH FIRST_ORDERS AS (
+    SELECT
+        CUSTOMER_ID,
+        DATE_TRUNC('month', MIN(ORDER_DATE))                           AS COHORT_MONTH
+    FROM
+        RAW.ORDERS
+    WHERE
+        ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+    GROUP BY
+        CUSTOMER_ID
+),
+
+ORDER_ACTIVITY AS (
+    SELECT
+        o.CUSTOMER_ID,
+        DATE_TRUNC('month', o.ORDER_DATE)                              AS ORDER_MONTH
+    FROM
+        RAW.ORDERS o
+    WHERE
+        o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+    GROUP BY
+        o.CUSTOMER_ID,
+        DATE_TRUNC('month', o.ORDER_DATE)
+),
+
+COHORT_DATA AS (
+    SELECT
+        fo.COHORT_MONTH,
+        oa.ORDER_MONTH,
+        DATEDIFF('month', fo.COHORT_MONTH, oa.ORDER_MONTH)            AS PERIOD_NUMBER,
+        COUNT(DISTINCT oa.CUSTOMER_ID)                                 AS ACTIVE_CUSTOMERS
+    FROM
+        FIRST_ORDERS fo
+        INNER JOIN ORDER_ACTIVITY oa
+            ON fo.CUSTOMER_ID = oa.CUSTOMER_ID
+    GROUP BY
+        fo.COHORT_MONTH,
+        oa.ORDER_MONTH,
+        DATEDIFF('month', fo.COHORT_MONTH, oa.ORDER_MONTH)
+),
+
+COHORT_SIZE AS (
+    SELECT
+        COHORT_MONTH,
+        COUNT(DISTINCT CUSTOMER_ID)                                    AS COHORT_CUSTOMER_COUNT
+    FROM
+        FIRST_ORDERS
+    GROUP BY
+        COHORT_MONTH
+)
+
+SELECT
+    cd.COHORT_MONTH,
+    cs.COHORT_CUSTOMER_COUNT,
+    cd.PERIOD_NUMBER,
+    cd.ACTIVE_CUSTOMERS,
+    ROUND(cd.ACTIVE_CUSTOMERS / cs.COHORT_CUSTOMER_COUNT * 100, 2)    AS RETENTION_RATE_PCT,
+    -- Previous period active customers for churn calc
+    LAG(cd.ACTIVE_CUSTOMERS, 1) OVER (
+        PARTITION BY cd.COHORT_MONTH
+        ORDER BY cd.PERIOD_NUMBER
+    )                                                                  AS PREV_PERIOD_ACTIVE,
+    CASE
+        WHEN cd.PERIOD_NUMBER = 0 THEN 'Acquisition'
+        WHEN cd.PERIOD_NUMBER <= 3 THEN 'Early Retention'
+        WHEN cd.PERIOD_NUMBER <= 12 THEN 'Mid Retention'
+        ELSE 'Long Term'
+    END                                                                AS RETENTION_STAGE
+FROM
+    COHORT_DATA cd
+    INNER JOIN COHORT_SIZE cs
+        ON cd.COHORT_MONTH = cs.COHORT_MONTH
+ORDER BY
+    cd.COHORT_MONTH,
+    cd.PERIOD_NUMBER;
+
+
+-- ============================================================
+-- SECTION 7: INVENTORY & DEMAND FORECASTING PREP
+-- Identify fast/slow movers with stockout risk
+-- ============================================================
+
+CREATE OR REPLACE VIEW ANALYTICS.V_INVENTORY_HEALTH AS
+
+WITH DAILY_SALES AS (
+    SELECT
+        oi.PRODUCT_ID,
+        DATE_TRUNC('day', o.ORDER_DATE)                                AS SALES_DAY,
+        SUM(oi.QUANTITY)                                               AS UNITS_SOLD
+    FROM
+        RAW.ORDER_ITEMS oi
+        INNER JOIN RAW.ORDERS o
+            ON oi.ORDER_ID = o.ORDER_ID
+    WHERE
+        o.ORDER_STATUS NOT IN ('CANCELLED', 'REFUNDED')
+        AND o.ORDER_DATE >= DATEADD('day', -90, CURRENT_DATE())
+    GROUP BY
+        oi.PRODUCT_ID,
+        DATE_TRUNC('day', o.ORDER_DATE)
+),
+
+AVG_DAILY_SALES AS (
+    SELECT
+        PRODUCT_ID,
+        AVG(UNITS_SOLD)                                                AS AVG_DAILY_UNITS,
+        STDDEV(UNITS_SOLD)                                             AS STDDEV_DAILY_UNITS,
+        MAX(UNITS_SOLD)                                                AS MAX_DAILY_UNITS,
+        COUNT(DISTINCT SALES_DAY)                                      AS DAYS_WITH_SALES
+    FROM
+        DAILY_SALES
+    GROUP BY
+        PRODUCT_ID
+),
+
+INVENTORY_STATUS AS (
+    SELECT
+        p.PRODUCT_ID,
+        p.PRODUCT_NAME,
+        p.CATEGORY,
+        p.SUBCATEGORY,
+        p.UNIT_COST,
+        p.UNIT_PRICE,
+        i.STOCK_ON_HAND,
+        i.REORDER_POINT,
+        i.REORDER_QUANTITY,
+        i.LEAD_TIME_DAYS,
+        ads.AVG_DAILY_UNITS,
+        ads.STDDEV_DAILY_UNITS,
+        ads.MAX_DAILY_UNITS,
+        ads.DAYS_WITH_SALES,
+        -- Days of stock remaining
+        CASE
+            WHEN COALESCE(ads.AVG_DAILY_UNITS, 0) = 0 THEN 9999
+            ELSE ROUND(i.STOCK_ON_HAND / ads.AVG_DAILY_UNITS, 1)
+        END                                                            AS DAYS_OF_STOCK,
+        -- Safety stock (1.65 sigma for 95% service level)
+        ROUND(1.65 * COALESCE(ads.STDDEV_DAILY_UNITS, 0) * SQRT(i.LEAD_TIME_DAYS), 0)
+                                                                       AS SAFETY_STOCK,
+        -- Inventory value
+        ROUND(i.STOCK_ON_HAND * p.UNIT_COST, 2)                       AS INVENTORY_VALUE,
+        -- Potential revenue
+        ROUND(i.STOCK_ON_HAND * p.UNIT_PRICE, 2)                      AS POTENTIAL_REVENUE,
+        -- Rank by inventory value within category
+        RANK() OVER (
+            PARTITION BY p.CATEGORY
+            ORDER BY i.STOCK_ON_HAND * p.UNIT_COST DESC
+        )                                                              AS INVENTORY_VALUE_RANK,
+        -- Rank by days of stock (ascending = most urgent first)
+        RANK() OVER (
+            ORDER BY
+                CASE
+                    WHEN COALESCE(ads.AVG_DAILY_UNITS, 0) = 0 THEN 9999
+                    ELSE ROUND(i.STOCK_ON_HAND / ads.AVG_DAILY_UNITS, 1)
+                END ASC
+        )                                                              AS STOCKOUT_URGENCY_RANK
+    FROM
+        RAW.PRODUCTS p
+        INNER JOIN RAW.INVENTORY i
+            ON p.PRODUCT_ID = i.PRODUCT_ID
+        LEFT JOIN AVG_DAILY_SALES ads
+            ON p.PRODUCT_ID = ads.PRODUCT_ID
+    WHERE
+        p.IS_ACTIVE = TRUE
+)
+
+SELECT
+    PRODUCT_ID,
+    PRODUCT_NAME,
+    CATEGORY,
+    SUBCATEGORY,
+    UNIT_COST,
+    UNIT_PRICE,
+    ROUND(UNIT_PRICE - UNIT_COST, 2)                                   AS UNIT_MARGIN,
+    ROUND((UNIT_PRICE - UNIT_COST) / NULLIF(UNIT_PRICE, 0) * 100, 2)  AS MARGIN_PCT,
+    STOCK_ON_HAND,
+    REORDER_POINT,
+    REORDER_QUANTITY,
+    LEAD_TIME_DAYS,
+    ROUND(AVG_DAILY_UNITS, 2)                                          AS AVG_DAILY_UNITS,
+    ROUND(STDDEV_DAILY_UNITS, 2)                                       AS STDDEV_DAILY_UNITS,
+    MAX_DAILY_UNITS,
+    DAYS_WITH_SALES,
+    DAYS_OF_STOCK,
+    SAFETY_STOCK,
+    INVENTORY_VALUE,
+    POTENTIAL_REVENUE,
+    INVENTORY_VALUE_RANK,
+    STOCKOUT_URGENCY_RANK,
+    CASE
+        WHEN DAYS_OF_STOCK <= LEAD_TIME_DAYS              THEN 'CRITICAL - Order Now'
+        WHEN DAYS_OF_STOCK <= LEAD_TIME_DAYS + 7          THEN 'WARNING - Order Soon'
+        WHEN DAYS_OF_STOCK <= 30                          THEN 'MONITOR'
+        WHEN DAYS_OF_STOCK >= 180                         THEN 'OVERSTOCK'
+        ELSE 'HEALTHY'
+    END                                                                AS STOCK_STATUS,
+    CASE
+        WHEN AVG_DAILY_UNITS >= 50  THEN 'Fast Mover'
+        WHEN AVG_DAILY_UNITS >= 10  THEN 'Medium Mover'
+        WHEN AVG_DAILY_UNITS >= 1   THEN 'Slow Mover'
+        ELSE 'Dead Stock'
+    END                                                                AS VELOCITY_CLASS
+FROM
+    INVENTORY_STATUS
+-- QUALIFY: only show products where stock is below safety stock threshold
+-- or where urgency rank is in top 50
+QUALIFY STOCKOUT_URGENCY_RANK <= 50
+    OR STOCK_ON_HAND < SAFETY_STOCK;
