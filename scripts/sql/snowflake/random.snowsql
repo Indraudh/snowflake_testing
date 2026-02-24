@@ -10,7 +10,7 @@
 -- ============================================================
 -- SECTION 1: DATABASE & SCHEMA SETUP
 -- ============================================================
-
+----- just another comment-----
 USE DATABASE SALES_DB;
 USE SCHEMA ANALYTICS;
 USE WAREHOUSE ANALYTICS_WH;
