@@ -1,1 +1,3 @@
-create table bla as select * employee;
+echo "SELEKT * FROMM employees WEHRE id = 1" > /tmp/bad.sql
+sqlfluff parse --dialect snowflake /tmp/bad.sql
+echo "Exit code: $?"
