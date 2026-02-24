@@ -64,7 +64,6 @@ def validate_file(filepath: str) -> tuple[bool, str, list[str]]:
             [
                 'sqlfluff', 'parse',
                 '--dialect', 'snowflake',   # Snowflake dialect inline — no .sqlfluff file needed
-                '--disable-progress-bar',
                 '--nofail',          # Don't exit non-zero for warnings, only real parse errors
                 tmp_path
             ],
