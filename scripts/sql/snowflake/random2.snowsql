@@ -1,3 +1,1 @@
-echo "SELEKT * FROMM employees WEHRE id = 1" > /tmp/bad.sql
-sqlfluff parse --dialect snowflake /tmp/bad.sql
-echo "Exit code: $?"
+create or replace table  jobs as select * from employee;
