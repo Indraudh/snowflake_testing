@@ -12,7 +12,7 @@
 -- ============================================================
 ----- just another comment-----
 USE DATABASE SALES_DB;
-USE SCHEMA ANALYTICS;
+USE SCHEM;
 USE WAREHOUSE ANALYTICS_WH;
 USE ROLE ANALYST_ROLE;
 
