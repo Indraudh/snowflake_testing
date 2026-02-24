@@ -59,7 +59,7 @@ jobs:
           #   ${ETL_SCHEMA}       →  add ETL_SCHEMA = "MY_SCHEMA"
           # ───────────────────────────────────────────────────────────────────
         run: |
-          python3 .github/scripts/validate_snowsql.py
+          python3 .github/workflows/validate_snowsql.py
 
       - name: Build error report
         if: failure() && steps.changed-files.outputs.files != ''
