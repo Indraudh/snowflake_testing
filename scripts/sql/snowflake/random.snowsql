@@ -63,7 +63,7 @@ RFM_SCORES AS (
         TOTAL_ORDERS,
         TOTAL_SPENT,
         LAST_ORDER_DATE,
-        FIRST_ORDER_DATE,
+        FIRST_ORDER_DATE
         RECENCY_DAYS,
         AVG_ORDER_VALUE,
         ACTIVE_MONTHS,
