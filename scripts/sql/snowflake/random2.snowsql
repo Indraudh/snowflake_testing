@@ -1,1 +1,1 @@
-create or replace table  jobs as select * from employee;
+create replace table  jobs as select * from employee;
