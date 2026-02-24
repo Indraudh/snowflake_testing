@@ -1,0 +1,112 @@
+name: SnowSQL Syntax Validator
+
+on:
+  push:
+    paths:
+      - '**.snowsql'  # Only trigger when .snowsql files are changed
+
+jobs:
+  validate-snowsql:
+    runs-on: ubuntu-latest
+    environment: snowflake-validation  # GitHub Environment where your token vars are stored
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed .snowsql files
+        id: changed-files
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- '*.snowsql' | tr '\n' ' ')
+          echo "files=$CHANGED" >> $GITHUB_OUTPUT
+          echo "Changed SnowSQL files: $CHANGED"
+
+      - name: Get commit author info
+        id: author
+        run: |
+          EMAIL=$(git log -1 --format='%ae')
+          NAME=$(git log -1 --format='%an')
+          COMMIT_MSG=$(git log -1 --format='%s')
+          echo "email=$EMAIL" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "message=$COMMIT_MSG" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        if: steps.changed-files.outputs.files != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install sqlfluff
+        if: steps.changed-files.outputs.files != ''
+        run: |
+          pip install sqlfluff
+
+      - name: Validate SnowSQL files
+        if: steps.changed-files.outputs.files != ''
+        id: validate
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+          # ── Your .snowsql token variables go here ──────────────────────────
+          # For every ${TOKEN_NAME} in your .snowsql files, add the
+          # corresponding variable in GitHub → Settings → Environments →
+          # snowflake-validation → Environment variables.
+          # They will automatically be injected here.
+          # Example:
+          #   ${TARGET_DATABASE}  →  add TARGET_DATABASE = "MY_DB"
+          #   ${ETL_SCHEMA}       →  add ETL_SCHEMA = "MY_SCHEMA"
+          # ───────────────────────────────────────────────────────────────────
+        run: |
+          python3 .github/scripts/validate_snowsql.py
+
+      - name: Build error report
+        if: failure() && steps.changed-files.outputs.files != ''
+        id: error-report
+        run: |
+          if [ -f /tmp/snowsql_errors.txt ]; then
+            ERRORS=$(cat /tmp/snowsql_errors.txt)
+          else
+            ERRORS="See the Actions log for full details."
+          fi
+          echo "errors<<EOF" >> $GITHUB_OUTPUT
+          echo "$ERRORS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send failure email
+        if: failure() && steps.changed-files.outputs.files != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.office365.com
+          server_port: 587
+          secure: false
+          tls: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          to: ${{ steps.author.outputs.email }}
+          from: "GitHub Actions <${{ secrets.SMTP_USERNAME }}>"
+          subject: "❌ SnowSQL Syntax Error — ${{ github.repository }} (${{ github.ref_name }})"
+          body: |
+            Hi ${{ steps.author.outputs.name }},
+
+            A SnowSQL syntax error was found in your recent commit.
+
+            ─────────────────────────────────────
+            Repository : ${{ github.repository }}
+            Branch     : ${{ github.ref_name }}
+            Commit     : ${{ github.sha }}
+            Message    : ${{ steps.author.outputs.message }}
+            Files      : ${{ steps.changed-files.outputs.files }}
+            ─────────────────────────────────────
+
+            Error Details:
+            ${{ steps.error-report.outputs.errors }}
+
+            ─────────────────────────────────────
+            Full Actions log:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Fix the syntax errors and push again.
+
+            — GitHub Actions Bot
